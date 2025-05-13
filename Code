@@ -1,1 +1,194 @@
+import json
+import os
 
+from cryptography.fernet import Fernet
+import telebot
+
+# Установка зависимостей:
+# pip install pyTelegramBotAPI cryptography
+
+# =============================
+# Telegram Password Manager Bot
+# =============================
+
+KEY_FILE = "secret.key"  # Файл с ключом шифрования
+DATA_FILE = "passwords.json"  # Файл с данными паролей
+
+def load_key():
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, "rb") as key_file:
+            return key_file.read()
+    else:
+        key = Fernet.generate_key()
+        with open(KEY_FILE, "wb") as key_file:
+            key_file.write(key)
+        return key
+
+fernet = Fernet(load_key())
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return {}
+    else:
+        return {}
+
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f)
+
+# Вставьте сюда ваш токен бота
+TOKEN = '7678573440:AAGc_Gz0pwwX3jSTxfhFPeFVOaUVLwYsAA4'
+bot: object = telebot.TeleBot(TOKEN)
+
+# Статусы состояний пользователя
+STATE_NONE = 0
+STATE_ADD_NAME = 1
+STATE_ADD_PASS = 2
+STATE_GET_NAME = 3
+STATE_DELETE_NAME = 4
+
+# Словарь to track user states and temporary data
+user_states = {}
+
+# Хелп и старт
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.send_message(message.chat.id,
+        "👋 Привет! Я менеджер паролей.\n\n"
+        "Доступные команды:\n"
+        "/add - Добавить пароль\n"
+        "/get - Получить пароль\n"
+        "/list - Список сохранённых записей\n"
+        "/delete - Удалить запись\n"
+        "/cancel - Отменить текущую операцию\n"
+        "/help - Помощь"
+    )
+    user_states.pop(message.from_user.id, None)
+
+@bot.message_handler(commands=['help'])
+def help_cmd(message):
+    bot.send_message(message.chat.id,
+        "Команды:\n"
+        "/add - Добавить новую запись (буду спрашивать имя и пароль)\n"
+        "/get - Получить пароль (спрошу имя)\n"
+        "/list - Показать список всех записей\n"
+        "/delete - Удалить запись (спрошу имя)\n"
+        "/cancel - Отменить текущую операцию"
+    )
+    user_states.pop(message.from_user.id, None)
+
+@bot.message_handler(commands=['cancel'])
+def cancel(message):
+    user_states.pop(message.from_user.id, None)
+    bot.send_message(message.chat.id, "Операция отменена.")
+
+# Список записей
+@bot.message_handler(commands=['list'])
+def list_entries(message):
+    data = load_data()
+    uid = str(message.from_user.id)
+    if uid in data and data[uid]:
+        names = "\n".join(data[uid].keys())
+        bot.send_message(message.chat.id, f"Ваши записи:\n{names}")
+    else:
+        bot.send_message(message.chat.id, "У вас нет сохранённых записей.")
+
+# Добавление записи - первый шаг: запрос имени
+@bot.message_handler(commands=['add'])
+def cmd_add(message):
+    bot.send_message(message.chat.id, "Введите имя записи (например, 'Email'):")
+    user_states[message.from_user.id] = {"state": STATE_ADD_NAME}
+
+# Получение пароля - запрос имени
+@bot.message_handler(commands=['get'])
+def cmd_get(message):
+    bot.send_message(message.chat.id, "Введите имя записи для получения пароля:")
+    user_states[message.from_user.id] = {"state": STATE_GET_NAME}
+
+# Удаление записи - запрос имени
+@bot.message_handler(commands=['delete'])
+def cmd_delete(message):
+    bot.send_message(message.chat.id, "Введите имя записи, которую хотите удалить:")
+    user_states[message.from_user.id] = {"state": STATE_DELETE_NAME}
+
+# Обработка сообщений для состояний
+@bot.message_handler(func=lambda message: True)
+def state_handler(message):
+    uid = message.from_user.id
+    text = message.text.strip()
+
+    if uid not in user_states:
+        bot.send_message(message.chat.id,
+                         "Пожалуйста, введите команду. Для помощи используйте /help")
+        return
+
+    state_info = user_states[uid]
+    state = state_info.get("state", STATE_NONE)
+
+    if state == STATE_ADD_NAME:
+        if not text:
+            bot.send_message(message.chat.id, "Имя записи не может быть пустым. Введите имя снова:")
+            return
+        # Сохраняем имя и спрашиваем пароль
+        user_states[uid]["entry_name"] = text
+        user_states[uid]["state"] = STATE_ADD_PASS
+        bot.send_message(message.chat.id, f"Введите пароль для записи '{text}':")
+
+    elif state == STATE_ADD_PASS:
+        if not text:
+            bot.send_message(message.chat.id, "Пароль не может быть пустым. Введите пароль снова:")
+            return
+        entry_name = user_states[uid].get("entry_name")
+        data = load_data()
+        if str(uid) not in data:
+            data[str(uid)] = {}
+        enc_password = fernet.encrypt(text.encode()).decode()
+        data[str(uid)][entry_name] = enc_password
+        save_data(data)
+        bot.send_message(message.chat.id, f"Пароль для '{entry_name}' успешно сохранён 🔒")
+        user_states.pop(uid, None)
+
+    elif state == STATE_GET_NAME:
+        if not text:
+            bot.send_message(message.chat.id, "Имя записи не может быть пустым. Введите имя снова:")
+            return
+        data = load_data()
+        if str(uid) in data and text in data[str(uid)]:
+            try:
+                decrypted = fernet.decrypt(data[str(uid)][text].encode()).decode()
+                bot.send_message(message.chat.id, f"Пароль для '{text}':\n{decrypted}\nБерегите его!")
+            except Exception:
+                bot.send_message(message.chat.id, "Ошибка при расшифровке пароля.")
+        else:
+            bot.send_message(message.chat.id, f"Запись с именем '{text}' не найдена.")
+        user_states.pop(uid, None)
+
+    elif state == STATE_DELETE_NAME:
+        if not text:
+            bot.send_message(message.chat.id, "Имя записи не может быть пустым. Введите имя снова:")
+            return
+        data = load_data()
+        if str(uid) in data and text in data[str(uid)]:
+            del data[str(uid)][text]
+            save_data(data)
+            bot.send_message(message.chat.id, f"Запись '{text}' удалена.")
+        else:
+            bot.send_message(message.chat.id, f"Запись с именем '{text}' не найдена.")
+        user_states.pop(uid, None)
+
+    else:
+        bot.send_message(message.chat.id,
+                         "Неизвестное состояние. Используйте /cancel и попробуйте заново.")
+        user_states.pop(uid, None)
+
+if __name__ == "__main__":
+    print("Бот запущен. Для остановки нажмите Ctrl+C")
+    bot.infinity_polling()
+
+
+def types():
+    return None
